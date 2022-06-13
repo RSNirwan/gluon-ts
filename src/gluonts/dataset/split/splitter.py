@@ -41,8 +41,9 @@ The module also supports rolling splits::
     train, test = splitter.rolling_split(whole_dataset, windows=7)
 """
 
+from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import List, Optional, cast
+from typing import List, Optional, cast, Union
 
 import numpy as np
 import pandas as pd
@@ -62,7 +63,7 @@ class TimeSeriesSlice(pydantic.BaseModel):
         arbitrary_types_allowed = True
 
     target: pd.Series
-    item: str
+    item: Union[str, None] = None
 
     feat_static_cat: List[int] = []
     feat_static_real: List[float] = []
@@ -73,33 +74,31 @@ class TimeSeriesSlice(pydantic.BaseModel):
     @classmethod
     def from_data_entry(
         cls, item: DataEntry, freq: Optional[str] = None
-    ) -> "TimeSeriesSlice":
+    ) -> TimeSeriesSlice:
         if freq is None:
-            freq = item["start"].freq
+            freq = item[FieldName.START].freq
 
         index = pd.period_range(
-            start=item["start"], freq=freq, periods=len(item["target"])
+            start=item[FieldName.START],
+            freq=freq,
+            periods=len(item[FieldName.TARGET]),
         )
 
         feat_dynamic_cat = [
             pd.Series(cat, index=index)
-            for cat in list(item.get("feat_dynamic_cat", []))
+            for cat in list(item.get(FieldName.FEAT_DYNAMIC_CAT, []))
         ]
 
         feat_dynamic_real = [
             pd.Series(real, index=index)
-            for real in list(item.get("feat_dynamic_real", []))
+            for real in list(item.get(FieldName.FEAT_DYNAMIC_REAL, []))
         ]
 
-        feat_static_cat = list(item.get("feat_static_cat", []))
-
-        feat_static_real = list(item.get("feat_static_real", []))
-
         return TimeSeriesSlice(
-            target=pd.Series(item["target"], index=index),
-            item=item[FieldName.ITEM_ID],
-            feat_static_cat=feat_static_cat,
-            feat_static_real=feat_static_real,
+            target=pd.Series(item[FieldName.TARGET], index=index),
+            item=item.get(FieldName.ITEM_ID),
+            feat_static_cat=list(item.get(FieldName.FEAT_STATIC_CAT, [])),
+            feat_static_real=list(item.get(FieldName.FEAT_STATIC_REAL, [])),
             feat_dynamic_cat=feat_dynamic_cat,
             feat_dynamic_real=feat_dynamic_real,
         )
@@ -107,10 +106,11 @@ class TimeSeriesSlice(pydantic.BaseModel):
     def to_data_entry(self) -> DataEntry:
         ret = {
             FieldName.START: self.start,
-            FieldName.ITEM_ID: self.item,
             FieldName.TARGET: self.target.values,
         }
 
+        if self.item:
+            ret[FieldName.ITEM_ID] = self.item
         if self.feat_static_cat:
             ret[FieldName.FEAT_STATIC_CAT] = self.feat_static_cat
         if self.feat_static_real:
@@ -139,7 +139,7 @@ class TimeSeriesSlice(pydantic.BaseModel):
     def __len__(self) -> int:
         return len(self.target)
 
-    def __getitem__(self, slice_: slice) -> "TimeSeriesSlice":
+    def __getitem__(self, slice_: slice) -> TimeSeriesSlice:
         feat_dynamic_real = []
         feat_dynamic_cat = []
 
@@ -208,27 +208,18 @@ class AbstractBaseSplitter(ABC):
         else:
             return item
 
-    def split(self, items: List[DataEntry]) -> TrainTestSplit:
-        split = TrainTestSplit()
-
-        for item in map(TimeSeriesSlice.from_data_entry, items):
-
-            train = self._train_slice(item)
-            test = self._trim_history(self._test_slice(item))
-
-            split._add_train_slice(train)
-
-            prediction_length = getattr(self, "prediction_length")
-
-            _check_split_length(train.end, test.end, prediction_length)
-            split._add_test_slice(test)
-
-        return split
+    def split(
+        self, items: List[DataEntry], ignore_short_ts: bool = False
+    ) -> TrainTestSplit:
+        return self.rolling_split(
+            items=items, windows=1, ignore_short_ts=ignore_short_ts
+        )
 
     def rolling_split(
         self,
         items: List[DataEntry],
         windows: int,
+        ignore_short_ts: bool = False,
         distance: Optional[int] = None,
     ) -> TrainTestSplit:
         # distance defaults to prediction_length
@@ -242,13 +233,18 @@ class AbstractBaseSplitter(ABC):
             train = self._train_slice(item)
             split._add_train_slice(train)
 
+            if not len(train) and ignore_short_ts:
+                continue
+            assert len(train), (
+                "Time series is not long enough for the split."
+                " Consider setting ``ignore_short_ts`` to ``True``."
+            )
             for window in range(windows):
                 offset = window * distance
                 test = self._trim_history(
                     self._test_slice(item, offset=offset)
                 )
                 prediction_length = getattr(self, "prediction_length")
-
                 _check_split_length(train.end, test.end, prediction_length)
                 split._add_test_slice(test)
 

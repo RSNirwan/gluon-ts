@@ -11,13 +11,25 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from gluonts.dataset.common import ListDataset
 from gluonts.dataset.field_names import FieldName
 from gluonts.dataset.repository.datasets import get_dataset
 from gluonts.dataset.split import DateSplitter, OffsetSplitter
 from gluonts.dataset.split.splitter import TimeSeriesSlice
+
+
+@pytest.fixture
+def my_list_data():
+    N, T = 2, 10
+    target = np.cumsum(np.ones(shape=(N, T)), axis=1)
+    s1, s2 = pd.Period("2021-01-01"), pd.Period("2021-01-08")
+    data = [{"start": s1, "target": list(t)} for t in target]
+    data.append({"start": s2, "target": list(range(3))})  # shorter ts
+    return ListDataset(data, freq="1D")
 
 
 def make_series(data, start="2020", freq="D"):
@@ -123,3 +135,27 @@ def test_negative_offset_splitter():
         43,
         50,
     ]
+
+
+def test_split_ignore_short_ts(my_list_data):
+    pl = 2
+    splitter = OffsetSplitter(prediction_length=pl, split_offset=-pl)
+    split = splitter.split(my_list_data, ignore_short_ts=True)
+    train, test = split.train, split.test
+    assert len(train) == 3
+    assert len(test) == 3
+    assert (
+        len(next(iter(test))["target"])
+        == len(next(iter(train))["target"]) + pl
+    )
+
+
+def test_split_ignore_short_ts_fail(my_list_data):
+    pl, num_roll = 2, 2
+    splitter = OffsetSplitter(
+        prediction_length=pl, split_offset=-num_roll * pl
+    )
+    with pytest.raises(AssertionError):
+        splitter.rolling_split(
+            my_list_data, windows=num_roll, ignore_short_ts=False
+        )
